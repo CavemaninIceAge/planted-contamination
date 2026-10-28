@@ -138,6 +138,8 @@ Diagnostic: pooled threshold from the rewrites of the 50 unplanted templates onl
 | Ref (70m) | raw | 100.0% ± 0.0 | 8.0% ± 1.4 |
 | Ref (70m) | normalised | 100.0% ± 0.0 | 7.2% ± 1.1 |
 
+NLL drop from fine-tuning, unplanted templates: originals 0.924 ± 0.034, their rewrites 0.808 ± 0.017 nats per token.
+
 ### E. Spill-over: score gain of rewrites, planted templates minus unplanted templates
 
 | Detector | Difference in differences | AUROC of per-template gain, planted vs unplanted | permutation p |

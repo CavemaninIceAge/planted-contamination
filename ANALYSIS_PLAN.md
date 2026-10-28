@@ -1,7 +1,8 @@
 # Analysis plan
 
-Written and committed before the main runs. The only thing chosen after this commit is the
-learning rate, by the pilot rule in section 5, using GSM8K *train* items only.
+Written and committed before the main runs. The learning rate was then chosen by the pilot rule
+in section 5, using GSM8K *train* items only. Sections 7 and 8 record the fixes made after this
+commit but before the main runs, and the analyses added after the first seed had finished.
 
 ## 1. Question
 

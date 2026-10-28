@@ -170,8 +170,9 @@ def test_padding_does_not_change_scores():
         from transformers import AutoModelForCausalLM, AutoTokenizer
 
         name = "EleutherAI/pythia-70m-deduped"
-        tok = AutoTokenizer.from_pretrained(name)
-        model = AutoModelForCausalLM.from_pretrained(name, dtype=torch.float32)
+        rev = "e93a9faa9c77e5d09219f6c868bfc7a1bd65593c"
+        tok = AutoTokenizer.from_pretrained(name, revision=rev)
+        model = AutoModelForCausalLM.from_pretrained(name, revision=rev, dtype=torch.float32)
     except Exception:
         pytest.skip("pythia-70m-deduped not available offline")
     texts = ["Question: short one?\nAnswer: 4\n#### 4",

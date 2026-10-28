@@ -1,6 +1,6 @@
 """All tables and figures in the README, computed from results/<tag>/ (see ANALYSIS_PLAN.md).
 
-  python scripts/analyze.py --tag pythia-160m-deduped-lr0.0001
+  python scripts/analyze.py --tag pythia-160m-deduped-lr3e-05
 
 Reads only per-item scores (ids and numbers); needs no GPU and no benchmark text.
 """
@@ -380,6 +380,18 @@ def contaminated_audit(base, seeds):
     return out
 
 
+def nll_drop_unplanted(base, seeds):
+    """Mean NLL drop (before minus after fine-tuning) of the unplanted template originals and of their rewrites."""
+    _, ob, rb = by_template(base, "test", "sym_raw", "nll")
+    orig, rew = [], []
+    for df, g in seeds.values():
+        ids, of, rf = by_template(df, "test", "sym_raw", "nll")
+        _, unseen = template_masks(ids, g)
+        orig.append((ob - of)[unseen].mean())
+        rew.append((rb - rf)[unseen].mean())
+    return {"originals": mean_sd(orig), "rewrites": mean_sd(rew)}
+
+
 def hypotheses(base, contaminated):
     out = {}
     h1, h2 = [], []
@@ -539,6 +551,9 @@ def markdown(s, ks, n_seeds):
             e = s["contaminated_audit"][d][layer]
             L.append(f"| {NAMES[d]} | {LAYER_NAMES[layer]} | {ms(e['recall_planted_unplanted_ref'], True)} | "
                      f"{ms(e['false_alarm_unseen_unplanted_ref'], True)} |")
+    nd = s["nll_drop_unplanted"]
+    L += ["", f"NLL drop from fine-tuning, unplanted templates: originals {ms(nd['originals'])}, "
+              f"their rewrites {ms(nd['rewrites'])} nats per token."]
     L += ["", "### E. Spill-over: score gain of rewrites, planted templates minus unplanted templates", "",
           "| Detector | Difference in differences | AUROC of per-template gain, planted vs unplanted | permutation p |",
           "|---|---|---|---|"]
@@ -695,7 +710,7 @@ def figures(s, ks, fig_dir, tag):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--tag", default="pythia-160m-deduped-lr0.0001")
+    ap.add_argument("--tag", default="pythia-160m-deduped-lr3e-05")
     ap.add_argument("--results", default=None, help="results directory (default results/<tag>)")
     ap.add_argument("--figures", default=None, help="figure directory (default figures/)")
     args = ap.parse_args()
@@ -710,6 +725,7 @@ def main():
         "threshold_source": threshold_source(seeds),
         "clean_audit": clean_audit(base),
         "contaminated_audit": contaminated,
+        "nll_drop_unplanted": nll_drop_unplanted(base, seeds),
         "hypotheses": hypotheses(base, contaminated),
         "blind_baseline": blind(base),
         "k1_timing": k1_timing(seeds),
