@@ -188,61 +188,100 @@ def mean_sd(values):
 # ---------------------------------------------------------------- analyses
 
 
+def exposures_of(seeds):
+    g = next(iter(seeds.values()))[1]["groups"]
+    return sorted(int(name[1:]) for name in g if name.startswith("k"))
+
+
+def planted_template_group(g):
+    return [name for name in g["groups"] if name.startswith("tmpl_k")][0]
+
+
+def template_masks(ids, g):
+    """Which templates had their original planted in this seed, and which stayed unseen."""
+    planted = np.isin(ids, g["groups"][planted_template_group(g)])
+    unseen = np.isin(ids, g["groups"]["tmpl_unseen"])
+    assert planted.sum() + unseen.sum() == len(ids)
+    return planted, unseen
+
+
 def negative_controls(base, seeds):
+    """Base model: GSM8K test vs train, and every planted group vs its unseen comparison before training.
+
+    For the planted groups the AUROC is averaged over seeds; its 90% interval resamples items
+    within each seed. "equivalent" means the 90% interval lies inside 0.5 +/- EQUIV.
+    """
     out = {}
     test = base[base["set"] == "test"]
     train = base[base["set"] == "train"]
+    g0 = next(iter(seeds.values()))[1]
+    pairs = [(f"k{k}", "unseen") for k in exposures_of(seeds)] + [(planted_template_group(g0), "tmpl_unseen")]
     for d in DETECTORS:
         a = metrics.auroc(test[d].to_numpy(float), train[d].to_numpy(float))
         lo, hi = item_bootstrap_auroc(test[d].to_numpy(float), train[d].to_numpy(float), level=0.90)
         planted = {}
-        for k in exposures_of(seeds):
-            vals = []
-            for s, (df, g) in seeds.items():
+        for pos, neg in pairs:
+            per_seed = []
+            for _, g in seeds.values():
                 lab = {i: name for name, idx in g["groups"].items() for i in idx}
                 grp = test["idx"].map(lab).to_numpy()
-                vals.append(metrics.auroc(test.loc[grp == f"k{k}", d].to_numpy(float),
-                                          test.loc[grp == "unseen", d].to_numpy(float)))
-            planted[f"k{k}"] = mean_sd(vals)
+                per_seed.append((test.loc[grp == pos, d].to_numpy(float), test.loc[grp == neg, d].to_numpy(float)))
+            rng = np.random.default_rng(0)
+            boot = [np.mean([metrics.auroc(p[rng.integers(0, len(p), len(p))], n[rng.integers(0, len(n), len(n))])
+                             for p, n in per_seed]) for _ in range(N_BOOT)]
+            plo, phi = ci(boot, 0.90)
+            planted[pos] = {**mean_sd([metrics.auroc(p, n) for p, n in per_seed]), "ci90": [plo, phi],
+                            "equivalent": bool(0.5 - EQUIV <= plo and phi <= 0.5 + EQUIV)}
         out[d] = {"auroc_test_vs_train": float(a), "ci90": [lo, hi],
                   "equivalent": bool(0.5 - EQUIV <= lo and hi <= 0.5 + EQUIV),
                   "planted_vs_unseen_before_training": planted}
     return out
 
 
-def exposures_of(seeds):
-    g = next(iter(seeds.values()))[1]["groups"]
-    return sorted(int(name[1:]) for name in g if name.startswith("k"))
-
-
 def test_bed(seeds):
-    """A: AUROC of each planted group vs the unseen non-template items, per seed."""
+    """A: AUROC of each planted group vs the 619 unseen non-template items, per seed."""
     out = {}
     for d in DETECTORS + ["oracle"]:
         row = {}
         for k in exposures_of(seeds):
             row[f"k{k}"] = mean_sd([metrics.auroc(group_scores(df, f"k{k}", d), group_scores(df, "unseen", d))
                                     for df, _ in seeds.values()])
-        tk = [name for name in next(iter(seeds.values()))[1]["groups"] if name.startswith("tmpl_k")][0]
-        row["template_originals"] = mean_sd([metrics.auroc(group_scores(df, tk, d), group_scores(df, "tmpl_unseen", d))
-                                             for df, _ in seeds.values()])
+        row["template_originals"] = mean_sd([metrics.auroc(group_scores(df, planted_template_group(g), d),
+                                                           group_scores(df, "unseen", d))
+                                             for df, g in seeds.values()])
         out[d] = row
     return out
 
 
 def threshold_source(seeds):
-    """B: thresholds from three reference sets on the fine-tuned model."""
+    """B: thresholds from three reference sets on the fine-tuned model.
+
+    The `*_unplanted` variants (diagnostic, added after the results) build the threshold from
+    the rewrites of the 50 templates whose original was NOT planted, which an auditor cannot
+    do; they separate spill-over from the rest of the rewrite effect.
+    """
     out = {}
-    for src in SOURCES:
+    for src in list(SOURCES) + ["sym_raw_unplanted", "sym_norm_unplanted"]:
+        ref_set = src.replace("_unplanted", "")
         out[src] = {}
         for d in DETECTORS + ["oracle"]:
-            fpr, tpr = [], {k: [] for k in exposures_of(seeds)}
-            for df, _ in seeds.values():
-                t = metrics.conformal_threshold(df.loc[df["set"] == src, d].to_numpy(float), ALPHA)
+            fpr, share, tpr = [], [], {k: [] for k in exposures_of(seeds)}
+            for df, g in seeds.values():
+                ref = df[df["set"] == ref_set]
+                if src.endswith("_unplanted"):
+                    ref = ref[ref["idx"].isin(g["groups"]["tmpl_unseen"])]
+                values = ref[d].to_numpy(float)
+                t = metrics.conformal_threshold(values, ALPHA)
                 fpr.append(metrics.rate_above(group_scores(df, "unseen", d), t))
                 for k in tpr:
                     tpr[k].append(metrics.rate_above(group_scores(df, f"k{k}", d), t))
-            out[src][d] = {"fpr_unseen": mean_sd(fpr), **{f"tpr_k{k}": mean_sd(v) for k, v in tpr.items()}}
+                if src in ("sym_raw", "sym_norm") and np.any(values > t):
+                    from_planted = ref["idx"].isin(g["groups"][planted_template_group(g)]).to_numpy()
+                    share.append(from_planted[values > t].mean())
+            entry = {"fpr_unseen": mean_sd(fpr), **{f"tpr_k{k}": mean_sd(v) for k, v in tpr.items()}}
+            if share:
+                entry["above_threshold_from_planted_templates"] = mean_sd(share)
+            out[src][d] = entry
     return out
 
 
@@ -266,6 +305,7 @@ def clean_audit(base):
                 "mean_rank_fraction": float(rf.mean()),
                 "mean_rank_fraction_ci": template_bootstrap(lambda i: rank_fraction(o[i], r[i]).mean(), n),
                 "own_rewrite_flagged": float(own_flags(o, r).mean()),
+                "own_rewrite_flagged_ci": template_bootstrap(lambda i: own_flags(o[i], r[i]).mean(), n),
                 "own_rewrite_flagged_expected": float(1 - np.ceil((r.shape[1] + 1) * (1 - ALPHA)) / (r.shape[1] + 1)),
                 "wilcoxon_p": float(wilcoxon(d_med).pvalue) if np.any(d_med != 0) else 1.0,
                 "median_diff": float(np.median(d_med)),
@@ -292,31 +332,41 @@ def clean_audit(base):
 
 
 def contaminated_audit(base, seeds):
-    """D and E: the rewrite audit after fine-tuning, and spill-over to rewrites."""
+    """D and E: the rewrite audit after fine-tuning, and spill-over to rewrites.
+
+    D is reported for raw and normalised rewrites. `*_unplanted_ref` (diagnostic, added after
+    the results) uses a pooled threshold from the rewrites of unplanted templates only.
+    """
     out = {}
     for d in DETECTORS:
-        rec, fa, rec_own, fa_own, rf_p, rf_u, did, auc_delta = [], [], [], [], [], [], [], []
-        deltas = []
-        _, _, r_base = by_template(base, "test", "sym_raw", d)
+        out[d] = {}
+        for layer in ("raw", "norm"):
+            m = {key: [] for key in ("recall_planted_pooled", "false_alarm_unseen_pooled", "recall_planted_own",
+                                     "false_alarm_unseen_own", "rank_fraction_planted", "rank_fraction_unseen",
+                                     "recall_planted_unplanted_ref", "false_alarm_unseen_unplanted_ref")}
+            for df, g in seeds.values():
+                ids, o, r = by_template(df, *LAYERS[layer], d)
+                planted, unseen = template_masks(ids, g)
+                pf, of, rf = pooled_flags(o, r), own_flags(o, r), rank_fraction(o, r)
+                pu = o > metrics.conformal_threshold(r[unseen].ravel(), ALPHA)
+                for key, values, mask in (("recall_planted_pooled", pf, planted), ("false_alarm_unseen_pooled", pf, unseen),
+                                          ("recall_planted_own", of, planted), ("false_alarm_unseen_own", of, unseen),
+                                          ("rank_fraction_planted", rf, planted), ("rank_fraction_unseen", rf, unseen),
+                                          ("recall_planted_unplanted_ref", pu, planted),
+                                          ("false_alarm_unseen_unplanted_ref", pu, unseen)):
+                    m[key].append(values[mask].mean())
+            out[d][layer] = {key: mean_sd(v) for key, v in m.items()}
+
+        did, auc_delta, deltas = [], [], []
+        ids_base, _, r_base = by_template(base, "test", "sym_raw", d)
         for df, g in seeds.values():
-            ids, o, r = by_template(df, "test", "sym_raw", d)
-            tk = [name for name in g["groups"] if name.startswith("tmpl_k")][0]
-            planted = np.isin(ids, g["groups"][tk])
-            unseen = np.isin(ids, g["groups"]["tmpl_unseen"])
-            assert planted.sum() + unseen.sum() == len(ids)
-            pf, of = pooled_flags(o, r), own_flags(o, r)
-            rec.append(pf[planted].mean())
-            fa.append(pf[unseen].mean())
-            rec_own.append(of[planted].mean())
-            fa_own.append(of[unseen].mean())
-            rf = rank_fraction(o, r)
-            rf_p.append(rf[planted].mean())
-            rf_u.append(rf[unseen].mean())
-            delta = (r - r_base).mean(1)
+            ids, _, r = by_template(df, "test", "sym_raw", d)
+            assert (ids == ids_base).all()
+            planted, unseen = template_masks(ids, g)
+            delta = (r - r_base).mean(1)  # per template: mean score gain of its rewrites from fine-tuning
             deltas.append((delta, planted))
             did.append(delta[planted].mean() - delta[unseen].mean())
             auc_delta.append(metrics.auroc(delta[planted], delta[unseen]))
-        observed = float(np.mean(did))
         rng = np.random.default_rng(2)
         null = np.empty(N_PERM)
         for b in range(N_PERM):
@@ -325,13 +375,8 @@ def contaminated_audit(base, seeds):
                 p = rng.permutation(planted)
                 vals.append(delta[p].mean() - delta[~p].mean())
             null[b] = np.mean(vals)
-        out[d] = {
-            "recall_planted_pooled": mean_sd(rec), "false_alarm_unseen_pooled": mean_sd(fa),
-            "recall_planted_own": mean_sd(rec_own), "false_alarm_unseen_own": mean_sd(fa_own),
-            "rank_fraction_planted": mean_sd(rf_p), "rank_fraction_unseen": mean_sd(rf_u),
-            "spillover_did": mean_sd(did), "spillover_auroc": mean_sd(auc_delta),
-            "spillover_p": perm_p(observed, null),
-        }
+        out[d].update(spillover_did=mean_sd(did), spillover_auroc=mean_sd(auc_delta),
+                      spillover_p=perm_p(float(np.mean(did)), null))
     return out
 
 
@@ -355,17 +400,20 @@ def hypotheses(base, contaminated):
 
 
 def blind(base):
+    """Surface features only, originals vs rewrites: pooled AUROC and the within-template rank used in C."""
     out = {}
     for name in ("raw", "norm"):
         rows = blind_baseline(base, *LAYERS[name])
         ids, o, r = by_template(rows.assign(set=np.where(rows["y"] == 1, "o", "r")), "o", "r", "blind")
         entry = {"blind_auroc": float(metrics.auroc(o, r.ravel())),
                  "blind_auroc_ci": template_bootstrap(lambda i: metrics.auroc(o[i], r[i].ravel()), len(ids)),
-                 "blind_mean_rank_fraction": float(rank_fraction(o, r).mean())}
+                 "blind_mean_rank_fraction": float(rank_fraction(o, r).mean()),
+                 "blind_mean_rank_fraction_ci": template_bootstrap(lambda i: rank_fraction(o[i], r[i]).mean(), len(ids))}
         for d in DETECTORS:
             _, od, rd = by_template(base, *LAYERS[name], d)
             entry[f"{d}_auroc"] = float(metrics.auroc(od, rd.ravel()))
             entry[f"{d}_auroc_ci"] = template_bootstrap(lambda i: metrics.auroc(od[i], rd[i].ravel()), len(ids))
+            entry[f"{d}_mean_rank_fraction"] = float(rank_fraction(od, rd).mean())
         out[name] = entry
     return out
 
@@ -410,75 +458,112 @@ def ci_pct(c):
     return f"[{100 * c[0]:.1f}, {100 * c[1]:.1f}]"
 
 
+def ci3(c):
+    return f"[{c[0]:.3f}, {c[1]:.3f}]"
+
+
+LAYER_NAMES = {"raw": "raw", "norm": "normalised", "adjusted": "normalised + adjusted",
+               "q_raw": "question only, raw", "q_norm": "question only, normalised"}
+SOURCE_ROWS = {"train": "unseen GSM8K train items", "sym_raw": "GSM-Symbolic rewrites",
+               "sym_norm": "normalised rewrites",
+               "sym_raw_unplanted": "rewrites of unplanted templates only (diagnostic)",
+               "sym_norm_unplanted": "normalised rewrites of unplanted templates only (diagnostic)"}
+
+
 def markdown(s, ks, n_seeds):
     L = []
+    tk = next(k for k in s["negative_controls"]["loss"]["planted_vs_unseen_before_training"] if k.startswith("tmpl"))
     L += [f"Results over {n_seeds} seeds: mean ± standard deviation across seeds, each metric computed within a seed.",
           "", "### Negative controls (base model, nothing planted)", "",
-          "| Detector | AUROC GSM8K test vs train [90% CI] | within 0.5 ± 0.05 | planted vs unseen before training, k=16 |",
-          "|---|---|---|---|"]
+          "| Detector | AUROC GSM8K test vs train [90% CI] | within 0.5 ± 0.05 |", "|---|---|---|"]
     for d in DETECTORS:
         e = s["negative_controls"][d]
-        L.append(f"| {NAMES[d]} | {f3(e['auroc_test_vs_train'])} [{e['ci90'][0]:.3f}, {e['ci90'][1]:.3f}] | "
-                 f"{'yes' if e['equivalent'] else 'no'} | {ms(e['planted_vs_unseen_before_training'][f'k{ks[-1]}'])} |")
-    L += ["", "### A. Test bed: AUROC of planted items vs unseen items, by number of exposures", "",
+        L.append(f"| {NAMES[d]} | {f3(e['auroc_test_vs_train'])} {ci3(e['ci90'])} | {'yes' if e['equivalent'] else 'no'} |")
+    L += ["", "AUROC of each group-to-be-planted vs its unseen comparison, before any training "
+              "[90% CI; * = interval not inside 0.5 ± 0.05]:", "",
+          "| Detector | " + " | ".join(f"k={k}" for k in ks) + " | template originals |", "|---" * (len(ks) + 2) + "|"]
+    for d in DETECTORS:
+        e = s["negative_controls"][d]["planted_vs_unseen_before_training"]
+        cells = [f"{x['mean']:.3f} [{x['ci90'][0]:.2f}, {x['ci90'][1]:.2f}]{'' if x['equivalent'] else ' *'}"
+                 for x in [e[f"k{k}"] for k in ks] + [e[tk]]]
+        L.append(f"| {NAMES[d]} | " + " | ".join(cells) + " |")
+    L += ["", "### A. Test bed: AUROC of planted items vs the 619 unseen test items, by number of exposures", "",
           "| Detector | " + " | ".join(f"k={k}" for k in ks) + " | template originals, k=16 |",
           "|---" * (len(ks) + 2) + "|"]
     for d in DETECTORS + ["oracle"]:
         e = s["test_bed"][d]
         L.append(f"| {NAMES[d]} | " + " | ".join(ms(e[f'k{k}']) for k in ks) + f" | {ms(e['template_originals'])} |")
     L += ["", "### B. Where the threshold comes from (fine-tuned model, 5% target false-positive rate)", "",
-          "| Threshold from | Detector | False positives on unseen test items | " + " | ".join(
+          "| Threshold from | Detector | Unseen test items flagged | " + " | ".join(
               f"detected, k={k}" for k in ks) + " |", "|---" * (len(ks) + 3) + "|"]
-    for src, label in SOURCES.items():
+    for src, label in SOURCE_ROWS.items():
         for d in DETECTORS + ["oracle"]:
             e = s["threshold_source"][src][d]
             L.append(f"| {label} | {NAMES[d]} | {ms(e['fpr_unseen'], True)} | "
                      + " | ".join(ms(e[f'tpr_k{k}'], True) for k in ks) + " |")
+    L += ["", "Share of the rewrites above the threshold that belong to the 50 planted templates:", "",
+          "| Detector | raw rewrites | normalised rewrites |", "|---|---|---|"]
+    for d in DETECTORS:
+        cells = [ms(s["threshold_source"][src][d]["above_threshold_from_planted_templates"], True)
+                 for src in ("sym_raw", "sym_norm")]
+        L.append(f"| {NAMES[d]} | " + " | ".join(cells) + " |")
     L += ["", "### C. Rewrite audit on the clean base model (all 100 originals unseen)", "",
-          "| Detector | Rewrites | Mean rank of original among its rewrites [95% CI] | Flagged vs own rewrites | "
+          "| Detector | Rewrites | Mean rank of original among its rewrites [95% CI] | Flagged vs own rewrites [95% CI] | "
           "Flagged by pooled rewrite threshold [95% CI] | All 1,319 test items flagged | Wilcoxon p |",
           "|---|---|---|---|---|---|---|"]
-    layer_names = {"raw": "raw", "norm": "normalised", "adjusted": "normalised + adjusted",
-                   "q_raw": "question only, raw", "q_norm": "question only, normalised"}
     for d in DETECTORS:
-        for layer, label in layer_names.items():
+        for layer, label in LAYER_NAMES.items():
             e = s["clean_audit"][d][layer]
             allf = pct(e["all_test_flagged"]) if "all_test_flagged" in e else "-"
-            L.append(f"| {NAMES[d]} | {label} | {f3(e['mean_rank_fraction'])} [{e['mean_rank_fraction_ci'][0]:.3f}, "
-                     f"{e['mean_rank_fraction_ci'][1]:.3f}] | {pct(e['own_rewrite_flagged'])} | "
+            L.append(f"| {NAMES[d]} | {label} | {f3(e['mean_rank_fraction'])} {ci3(e['mean_rank_fraction_ci'])} | "
+                     f"{pct(e['own_rewrite_flagged'])} {ci_pct(e['own_rewrite_flagged_ci'])} | "
                      f"{pct(e['pooled_flagged'])} {ci_pct(e['pooled_flagged_ci'])} | {allf} | {e['wilcoxon_p']:.2g} |")
     exp_own = s["clean_audit"][DETECTORS[0]]["raw"]["own_rewrite_flagged_expected"]
     L += ["", f"Under exchangeability the mean rank is 0.5, {pct(exp_own)} of originals are flagged against their own "
               "rewrites, and at most 5% by the pooled threshold.", "",
           "### D. Rewrite audit on the contaminated model (50 originals planted 16 times, 50 unseen)", "",
-          "| Detector | Pooled threshold: planted caught | Pooled threshold: unseen flagged | Own rewrites: planted caught | "
-          "Own rewrites: unseen flagged | Mean rank, planted | Mean rank, unseen |", "|---|---|---|---|---|---|---|"]
+          "| Detector | Rewrites | Pooled threshold: planted caught | Pooled threshold: unseen flagged | "
+          "Own rewrites: planted caught | Own rewrites: unseen flagged | Mean rank, planted | Mean rank, unseen |",
+          "|---|---|---|---|---|---|---|---|"]
     for d in DETECTORS:
-        e = s["contaminated_audit"][d]
-        L.append(f"| {NAMES[d]} | {ms(e['recall_planted_pooled'], True)} | {ms(e['false_alarm_unseen_pooled'], True)} | "
-                 f"{ms(e['recall_planted_own'], True)} | {ms(e['false_alarm_unseen_own'], True)} | "
-                 f"{ms(e['rank_fraction_planted'])} | {ms(e['rank_fraction_unseen'])} |")
+        for layer in ("raw", "norm"):
+            e = s["contaminated_audit"][d][layer]
+            L.append(f"| {NAMES[d]} | {LAYER_NAMES[layer]} | {ms(e['recall_planted_pooled'], True)} | "
+                     f"{ms(e['false_alarm_unseen_pooled'], True)} | {ms(e['recall_planted_own'], True)} | "
+                     f"{ms(e['false_alarm_unseen_own'], True)} | {ms(e['rank_fraction_planted'])} | "
+                     f"{ms(e['rank_fraction_unseen'])} |")
+    L += ["", "Diagnostic: pooled threshold from the rewrites of the 50 unplanted templates only (an auditor cannot do this):",
+          "", "| Detector | Rewrites | planted caught | unseen flagged |", "|---|---|---|---|"]
+    for d in DETECTORS:
+        for layer in ("raw", "norm"):
+            e = s["contaminated_audit"][d][layer]
+            L.append(f"| {NAMES[d]} | {LAYER_NAMES[layer]} | {ms(e['recall_planted_unplanted_ref'], True)} | "
+                     f"{ms(e['false_alarm_unseen_unplanted_ref'], True)} |")
     L += ["", "### E. Spill-over: score gain of rewrites, planted templates minus unplanted templates", "",
           "| Detector | Difference in differences | AUROC of per-template gain, planted vs unplanted | permutation p |",
           "|---|---|---|---|"]
     for d in DETECTORS:
         e = s["contaminated_audit"][d]
         L.append(f"| {NAMES[d]} | {ms(e['spillover_did'])} | {ms(e['spillover_auroc'])} | {e['spillover_p']:.2g} |")
-    L += ["", "### Pre-registered hypotheses (Holm-corrected over the five detectors)", "",
+    L += ["", "Loss and Ref give the same gain by construction (the reference model's term cancels), and both equal "
+              "the Oracle score of the rewrites.", "",
+          "### Pre-registered hypotheses (Holm-corrected over the five detectors)", "",
           "| Hypothesis | Detector | Statistic | p | Holm p |", "|---|---|---|---|---|"]
-    labels = {"H1": "H1 clean originals flagged > 5% (raw rewrites)", "H2": "H2 mean rank ≠ 0.5 (normalised)",
-              "H3": "H3 spill-over > 0"}
+    labels = {"H1": "H1 clean originals flagged by raw-rewrite threshold, above exchangeable rate",
+              "H2": "H2 mean rank ≠ 0.5 (normalised)", "H3": "H3 spill-over > 0"}
     for h, label in labels.items():
         for d in DETECTORS:
             e = s["hypotheses"][h][d]
             L.append(f"| {label} | {NAMES[d]} | {e['statistic']:.3g} | {e['p']:.2g} | {e['p_holm']:.2g} |")
     L += ["", "### Blind baseline: surface features only, originals vs rewrites (base model)", "",
-          "| Rewrites | Surface-feature classifier AUROC [95% CI] | " + " | ".join(NAMES[d] for d in DETECTORS) + " |",
-          "|---" * (len(DETECTORS) + 2) + "|"]
+          "| Rewrites | Classifier: pooled AUROC [95% CI] | Classifier: mean rank among own rewrites [95% CI] | "
+          + " | ".join(f"{NAMES[d]}: pooled AUROC / mean rank" for d in DETECTORS) + " |",
+          "|---" * (len(DETECTORS) + 3) + "|"]
     for layer in ("raw", "norm"):
         e = s["blind_baseline"][layer]
-        L.append(f"| {layer_names[layer]} | {f3(e['blind_auroc'])} [{e['blind_auroc_ci'][0]:.3f}, {e['blind_auroc_ci'][1]:.3f}] | "
-                 + " | ".join(f"{f3(e[f'{d}_auroc'])}" for d in DETECTORS) + " |")
+        L.append(f"| {LAYER_NAMES[layer]} | {f3(e['blind_auroc'])} {ci3(e['blind_auroc_ci'])} | "
+                 f"{f3(e['blind_mean_rank_fraction'])} {ci3(e['blind_mean_rank_fraction_ci'])} | "
+                 + " | ".join(f"{f3(e[f'{d}_auroc'])} / {f3(e[f'{d}_mean_rank_fraction'])}" for d in DETECTORS) + " |")
     if s["k1_timing"]:
         L += ["", "### Exploratory: single exposure early vs late in training (train-reference threshold)", "",
               "| Detector | detected, first half | detected, second half |", "|---|---|---|"]
@@ -516,27 +601,30 @@ def figures(s, ks, fig_dir, tag):
     plt.rcParams.update({"font.size": 9, "text.color": INK, "axes.labelcolor": INK, "axes.titlecolor": INK})
 
     # Figure 1: threshold source
-    f, ax = plt.subplots(1, 3, figsize=(12, 3.8), gridspec_kw={"width_ratios": [1.1, 1, 1]})
+    f, ax = plt.subplots(1, 3, figsize=(13, 4.0), gridspec_kw={"width_ratios": [1.35, 1, 1]})
     f.patch.set_facecolor(SURFACE)
-    src_labels = ["unseen GSM8K\ntrain items", "GSM-Symbolic\nrewrites", "normalised\nrewrites"]
-    vals = {d: [100 * s["threshold_source"][src][d]["fpr_unseen"]["mean"] for src in SOURCES] for d in DETECTORS}
-    errs = {d: [100 * s["threshold_source"][src][d]["fpr_unseen"]["sd"] for src in SOURCES] for d in DETECTORS}
+    srcs = ["train", "sym_raw", "sym_norm", "sym_raw_unplanted"]
+    src_labels = ["unseen GSM8K\ntrain items", "GSM-Symbolic\nrewrites", "normalised\nrewrites",
+                  "rewrites of unplanted\ntemplates (diagnostic)"]
+    vals = {d: [100 * s["threshold_source"][src][d]["fpr_unseen"]["mean"] for src in srcs] for d in DETECTORS}
+    errs = {d: [100 * s["threshold_source"][src][d]["fpr_unseen"]["sd"] for src in srcs] for d in DETECTORS}
     bars(ax[0], src_labels, vals, errs)
     ax[0].axhline(100 * ALPHA, color=INK2, ls="--", lw=1)
-    ax[0].set_ylabel("unseen test items flagged (%)")
+    ax[0].set_ylabel("unseen test items flagged (%)\nmean ± SD over seeds")
     ax[0].set_title("(a) False positives, by where the threshold comes from", fontsize=9, loc="left")
+    ax[0].tick_params(axis="x", labelsize=7)
     for a, src, title in ((ax[1], "train", "(b) Detected, threshold from unseen train items"),
-                          (ax[2], "sym_raw", "(c) Detected, threshold from rewrites")):
+                          (ax[2], "sym_raw", "(c) Detected, threshold from all rewrites")):
         for d in DETECTORS + ["oracle"]:
             e = s["threshold_source"][src][d]
             y = [100 * e[f"tpr_k{k}"]["mean"] for k in ks]
             a.plot(ks, y, color=COLORS[d], lw=2, ls="--" if d == "oracle" else "-", marker="o", ms=4,
-                   label=NAMES[d] + (" (upper bound)" if d == "oracle" else ""))
+                   label=NAMES[d] + (" (NLL before - after)" if d == "oracle" else ""))
         a.set_xscale("log", base=2)
         a.set_xticks(ks, [str(k) for k in ks])
         a.set_ylim(0, 100)
         a.set_xlabel("times the item appeared in training")
-        a.set_ylabel("planted items flagged (%)")
+        a.set_ylabel("planted items flagged (%), mean over seeds")
         a.set_title(title, fontsize=9, loc="left")
     for a in ax:
         style(a)
@@ -546,37 +634,45 @@ def figures(s, ks, fig_dir, tag):
     plt.close(f)
 
     # Figure 2: clean-model audit
-    f, ax = plt.subplots(1, 2, figsize=(10, 3.6))
+    f, ax = plt.subplots(1, 2, figsize=(11, 3.8))
     f.patch.set_facecolor(SURFACE)
     layers = ["raw", "norm", "adjusted"]
     labels = ["raw rewrites", "normalised", "normalised +\nadjusted"]
     ca = s["clean_audit"]
-    vals = {d: [100 * ca[d][layer]["pooled_flagged"] for layer in layers] for d in DETECTORS}
-    errs = {d: np.array([[100 * (ca[d][layer]["pooled_flagged"] - ca[d][layer]["pooled_flagged_ci"][0]) for layer in layers],
-                         [100 * (ca[d][layer]["pooled_flagged_ci"][1] - ca[d][layer]["pooled_flagged"]) for layer in layers]])
-            for d in DETECTORS}
+
+    def bar_ci(key):
+        vals = {d: [100 * ca[d][layer][key] for layer in layers] for d in DETECTORS}
+        errs = {d: np.array([[100 * (ca[d][layer][key] - ca[d][layer][key + "_ci"][0]) for layer in layers],
+                             [100 * (ca[d][layer][key + "_ci"][1] - ca[d][layer][key]) for layer in layers]])
+                for d in DETECTORS}
+        return vals, errs
+
+    vals, errs = bar_ci("own_rewrite_flagged")
     bars(ax[0], labels, vals, errs)
-    ax[0].axhline(100 * ALPHA, color=INK2, ls="--", lw=1)
+    ax[0].axhline(100 * ca["loss"]["raw"]["own_rewrite_flagged_expected"], color=INK2, ls="--", lw=1)
     ax[0].set_ylabel("unseen originals flagged (%)")
-    ax[0].set_title("(a) Clean model: originals flagged by the rewrite threshold", fontsize=9, loc="left")
+    ax[0].set_title("(a) Clean model: originals flagged against their own 50 rewrites\n"
+                    "dashed: rate if originals and rewrites were exchangeable; bars: 95% template-bootstrap CI",
+                    fontsize=8.5, loc="left")
     vals = {d: [ca[d][layer]["mean_rank_fraction"] for layer in layers] for d in DETECTORS}
     errs = {d: np.array([[ca[d][layer]["mean_rank_fraction"] - ca[d][layer]["mean_rank_fraction_ci"][0] for layer in layers],
                          [ca[d][layer]["mean_rank_fraction_ci"][1] - ca[d][layer]["mean_rank_fraction"] for layer in layers]])
             for d in DETECTORS}
     bars(ax[1], labels, vals, errs)
     ax[1].axhline(0.5, color=INK2, ls="--", lw=1)
-    ax[1].set_ylim(0, 1)
+    ax[1].set_ylim(0, 1.08)
     ax[1].set_ylabel("mean rank of original among its rewrites")
-    ax[1].set_title("(b) Clean model: where originals rank (0.5 = no difference)", fontsize=9, loc="left")
+    ax[1].set_title("(b) Clean model: where originals rank (0.5 = no difference)\nbars: 95% template-bootstrap CI",
+                    fontsize=8.5, loc="left")
     for a in ax:
         style(a)
-    ax[1].legend(fontsize=7, frameon=False, loc="upper right", ncol=2)
+    ax[1].legend(fontsize=7, frameon=False, loc="upper center", ncol=5)
     f.tight_layout()
     f.savefig(fig_dir / f"clean_audit_{tag}.png", dpi=170, facecolor=SURFACE)
     plt.close(f)
 
     # Figure 3: dose-response (test bed check)
-    f, a = plt.subplots(figsize=(5.2, 3.6))
+    f, a = plt.subplots(figsize=(5.4, 3.8))
     f.patch.set_facecolor(SURFACE)
     for d in DETECTORS + ["oracle"]:
         e = s["test_bed"][d]
@@ -589,7 +685,7 @@ def figures(s, ks, fig_dir, tag):
     a.set_xticks(ks, [str(k) for k in ks])
     a.set_ylim(0.4, 1.0)
     a.set_xlabel("times the item appeared in training")
-    a.set_ylabel("AUROC, planted vs unseen test items")
+    a.set_ylabel("AUROC, planted vs unseen test items\n(band: ± 1 SD over seeds)")
     style(a)
     a.legend(fontsize=7, frameon=False, loc="lower right")
     f.tight_layout()

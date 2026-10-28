@@ -124,3 +124,23 @@ computed. A code review found them; each is a fix, not a choice informed by resu
 4. **Bookkeeping.** Results are written atomically, cached base and reference scores are tied to
    a hash of the scored texts, a seed is skipped on resume only if it was run with the same
    settings, and the default results directory includes the learning rate.
+
+## 8. Added after the first seed's results
+
+A second review of the analysis code, run once seed 0 had finished, led to these additions. None
+changes a pre-registered number; the additions are labelled as diagnostic or post hoc in the
+README.
+
+1. **Spill-over diagnostic for the rewrite threshold.** After fine-tuning, every rewrite above
+   the pooled rewrite threshold came from the 50 planted templates, so the B and D results with
+   rewrite thresholds depend on how many templates are planted and how often. Added: the same
+   thresholds built only from the rewrites of the 50 unplanted templates (an auditor cannot do
+   this), and the share of above-threshold rewrites that come from planted templates.
+2. **Oracle is not an upper bound.** Section 3 calls it one; the data show it below Loss,
+   Min-K% and Min-K%++, because the NLL drop of unseen items depends on how hard they were to
+   begin with. It is now described as "NLL before minus after fine-tuning", still outside every
+   hypothesis family.
+3. **Coverage fixes.** D is reported for normalised rewrites as well as raw ones; the template
+   originals in A are compared with the 619 unseen items as section 4 says; the before-training
+   negative controls now include the template group, with 90% intervals and the equivalence
+   rule; the blind baseline also reports the within-template rank used in C and H2.
