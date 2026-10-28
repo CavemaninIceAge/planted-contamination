@@ -12,10 +12,11 @@ threshold: treating rewritten versions of the benchmark (here GSM-Symbolic [14])
 - **Rewrites are not a neutral reference, even on a clean model.** Before any planting, an
   original GSM8K question outranks its own 50 GSM-Symbolic rewrites far more often than chance:
   with the Loss score, 29% of the 100 never-seen originals land above a 5% threshold
-  built from their own rewrites, where exchangeability allows 3.9%. This per-template
-  comparison is descriptive; the pre-registered test (H1) pools all 5,000 rewrites into one
-  threshold, and there the excess is significant for Min-K% (11%) and Min-K%++ (10%)
-  but not for Loss (6%). The base model has seen neither set, so none of this preference is
+  built from their own rewrites, where exchangeability allows 3.9%. That rate is
+  descriptive. Two pre-registered tests bear on it: the original's mean rank among its own
+  normalised rewrites differs from 0.5 for Loss, Zlib, Min-K% and Min-K%++ (H2, Holm p < 0.001);
+  and with one threshold pooled over all 5,000 rewrites (H1) the excess is significant for Min-K%
+  (11%) and Min-K%++ (10%) but not for Loss (6%). The base model has seen neither set, so none of this preference is
   membership: a classifier on surface features alone (length, digits, currency signs) separates
   originals from rewrites when all texts are pooled (AUROC 0.70, against
   0.48–0.58 for the detectors), and normalising the surface form or adjusting for length
@@ -31,8 +32,8 @@ threshold: treating rewritten versions of the benchmark (here GSM-Symbolic [14])
   first seed). Only this one contamination level was run.
 - **Comparing each original with its own rewrites keeps its false alarms.** On the contaminated
   model it catches the planted originals (all of them for four detectors, 99.2% for Ref)
-  but still flags 12–41% of the unplanted ones, against 7–32% on the clean model; Ref
-  rises from 7% to 24%.
+  but still flags 12–41% of the unplanted ones, against 7–32% of all 100 originals on the
+  clean model; Ref rises from 7% to 24%.
 - **An unseen in-distribution reference comes close to its promise.** Thresholds from 1,000 unseen
   GSM8K train items flag 4.8–5.9% of the 619 unseen test items and give the expected
   dose-response (figure 1b). Two caveats: on the base model, test items already score slightly
@@ -82,7 +83,7 @@ different blocks, and every block is trained on.
 | Min-K% | mean of the lowest 20% of token log-probabilities | Shi et al. [1] |
 | Min-K%++ | mean of the lowest 20% of (log p - mu) / sigma, mu and sigma taken over the next-token distribution | Zhang et al. [2] |
 | Ref (70m) | NLL under pythia-70m minus NLL under the target | difficulty calibration [22], MIMIR [5] |
-| Oracle | NLL before fine-tuning minus NLL after | needs the model before fine-tuning, which an auditor never has; not an upper bound (it trails Loss, Min-K% and Min-K%++ in table 1) |
+| Oracle | NLL before fine-tuning minus NLL after | needs the model before fine-tuning, which an auditor never has; not an upper bound (it trails every detector except Zlib in table 1) |
 
 Texts are scored with an end-of-text token in front, the same context every planted copy had in
 training.
@@ -108,14 +109,18 @@ Holm-corrected over the five detectors.
   difference in differences of the rewrites' score gain, planted templates minus unplanted
   templates, is above zero. Test: planted labels permuted across templates within each seed.
 
-**What changed after the plan.** The plan was committed before the main runs. After that, the
-learning rate was set by its pilot rule (GSM8K train items only, no test items touched); four
-fixes were made before any main run (section 7: float32 training, every planted copy trained on,
-the conformal threshold rule, bookkeeping); and some analyses were added after the first seed had
-finished (section 8: thresholds from the rewrites of unplanted templates, the share of
-above-threshold rewrites that come from planted templates, the normalised-rewrite version of the
-contaminated audit, fuller negative controls, the blind baseline's within-template rank). These
-additions are labelled as diagnostics below and change no pre-registered number.
+**What changed after the plan.** The plan was committed before the main runs; the order rests on
+this repository's commit history, not on an external registry. After that commit: the learning
+rate was set by its pilot rule (GSM8K train items only, no test items touched); four fixes were
+made before any main run (section 7: float32 training, every planted copy trained on, the
+conformal threshold rule, bookkeeping), in the same commit that wrote the analysis code, including
+the permutation tests for H1-H3, which the plan names but does not specify; some analyses were
+added after the first seed had finished (section 8: thresholds from the rewrites of unplanted
+templates, the share of above-threshold rewrites that come from planted templates, the
+normalised-rewrite version of the contaminated audit, the template-group negative control, the
+blind baseline's within-template rank); and one, the NLL drop of unplanted originals and their
+rewrites, after all five seeds. These are marked post hoc where they appear and change no
+pre-registered number.
 
 ## Results
 
@@ -127,10 +132,11 @@ Loss already reached AUROC 0.993 on items seen 4 times
 
 ### The test bed behaves as it should
 
-Before training, every dose group is indistinguishable from the unseen items (AUROC
-0.479–0.518, every 90% interval inside 0.5 ± 0.05). The 50 template originals drawn for planting
-sit slightly below the 50 left unplanted (0.448–0.476, intervals reaching down to 0.41), which, if
-anything, makes them harder to catch. GSM8K test and train items differ only slightly on the base
+Before training, every dose group is indistinguishable from the unseen items when the AUROC is
+averaged over the five seeds' draws (0.479–0.518, every 90% interval inside 0.5 ± 0.05; single
+draws range from 0.438 to 0.569). The 50 template originals drawn for planting sit slightly
+below the 50 left unplanted (seed means 0.448–0.476, intervals reaching down to 0.41; a post hoc
+control), which, if anything, makes them harder to catch. GSM8K test and train items differ only slightly on the base
 model (AUROC 0.511–0.538; for Loss, Min-K% and Min-K%++ the 90% interval reaches past 0.55). After
 training, detection rises with the number of exposures, from AUROC 0.60–0.69 for a single exposure to
 at least 0.989 at 16.
@@ -165,7 +171,7 @@ The model has seen neither set, so this is distribution shift, not membership. A
 regression on surface features alone (characters, tokens, digits, longest number, non-ASCII
 share, currency signs, `.0`), cross-validated by template, separates originals from rewrites
 better than the detectors when all texts are pooled (AUROC 0.70 against
-0.48–0.58). Within a template it is not better everywhere: its mean rank is
+0.48–0.58). Within a template (a post hoc comparison) it is not better everywhere: its mean rank is
 0.66 on raw rewrites, below Loss (0.73) and Min-K% (0.76), and
 0.79 [0.74, 0.84] on normalised ones, level with Min-K% (0.77).
 The reference-model score, which subtracts how predictable a text is to a smaller model trained
@@ -210,9 +216,11 @@ change names and numbers, so this is expected; its consequence for the audit is 
 - **Own-rewrite comparison.** Planted originals beat their rewrites (all of them for four
   detectors, 99.2% for Ref), but 12–41% of the unplanted originals are flagged too.
   Ref, with no significant bias on the clean model (7% flagged), flags 24%.
-  Ref changes only through the target model, so this means fine-tuning on GSM8K text lowered the
-  NLL of the unplanted originals more than that of their own rewrites (0.92 against
-  0.81 nats per token, averaged over seeds).
+  Ref changes only through the target model, so fine-tuning lowered the NLL of the unplanted
+  originals more than that of their own rewrites (0.92 against 0.81 nats per
+  token, averaged over seeds; a post hoc check added after all five seeds). Every run planted
+  GSM8K items, so this does not separate the effect of the planted GSM8K text from that of the
+  fine-tuning as such.
 
 
 **Table 3. Where the threshold comes from** (fine-tuned models, 5% target, % of items flagged, mean ± SD over seeds).
@@ -239,7 +247,9 @@ change names and numbers, so this is expected; its consequence for the audit is 
 
 ### Pre-registered hypotheses
 
-H1 holds for Min-K%, Min-K%++ only; H2 holds for Loss, Zlib, Min-K%, Min-K%++, and not for Ref; H3 holds for all five.
+H1 is supported for Min-K%, Min-K%++ only (not significant for the others); H2 is supported for
+Loss, Zlib, Min-K%, Min-K%++, and not significant for Ref, which does not show that Ref is unbiased; H3 is
+supported for all five.
 Loss and Ref have the same spill-over by construction: the reference model's NLL cancels in the
 before-minus-after difference.
 
@@ -313,8 +323,11 @@ tables and figures, run `.venv/bin/python scripts/analyze.py --tag pythia-160m-d
 ## Limitations
 
 - Planted text is about 13% of the fine-tuning tokens, far more than any real contamination
-  rate, and the filler (WikiText-103) is itself part of the Pile, so most of the gradient comes
-  from the planted items.
+  rate. The filler is not neutral either: the training loss falls from about 4.7-5.1 to about 3.1
+  nats per token over the epoch (`trainlog_seed*.json`), while the planted tokens, about 3.36
+  nats each on the base model, can account for at most about 0.45 of that drop, so most of the
+  adaptation is to the filler. Fine-tuning also lowers the NLL of never-planted GSM8K items by
+  about 0.9 nats per token.
 - Continued pretraining on 4.6M tokens is not pretraining on hundreds of billions; a planted item
   here is also seen close to the end of training.
 - One small model (160M parameters), one learning rate, one benchmark family.

@@ -138,10 +138,17 @@ README.
    thresholds built only from the rewrites of the 50 unplanted templates (an auditor cannot do
    this), and the share of above-threshold rewrites that come from planted templates.
 2. **Oracle is not an upper bound.** Section 3 calls it one; the data show it below Loss,
-   Min-K% and Min-K%++, because the NLL drop of unseen items depends on how hard they were to
-   begin with. It is now described as "NLL before minus after fine-tuning", still outside every
+   Min-K% and Min-K%++ (with all five seeds: below every detector except Zlib), because the NLL
+   drop of unseen items depends on how hard they were to begin with. It is now described as "NLL before minus after fine-tuning", still outside every
    hypothesis family.
 3. **Coverage fixes.** D is reported for normalised rewrites as well as raw ones; the template
    originals in A are compared with the 619 unseen items as section 4 says; the before-training
    negative controls now include the template group, with 90% intervals and the equivalence
    rule; the blind baseline also reports the within-template rank used in C and H2.
+4. **Added after all five seeds.** The NLL drop from fine-tuning of the unplanted template
+   originals and of their rewrites, which explains why Ref flags unplanted originals after
+   fine-tuning. Post hoc.
+5. **Test procedures.** Section 6 names H1-H3 and the Holm correction but not the tests. The
+   permutation tests (within-template exchangeability for H1 and H2, planted labels permuted
+   across templates within each seed for H3) were written in the same commit as the section 7
+   fixes, before any main run.
