@@ -3,14 +3,17 @@
 Writes per-item detector scores (ids and numbers only, never benchmark text) to
 results/<tag>/. See ANALYSIS_PLAN.md for the design.
 
-  python scripts/run_experiments.py --pilot --lr 1e-4     # pilot on GSM8K train items only
-  python scripts/run_experiments.py --seeds 0 1 2 3 4     # main runs
+  python scripts/run_experiments.py --pilot --lr 1e-4             # pilot on GSM8K train items only
+  python scripts/run_experiments.py --lr <pilot decision> --seeds 0 1 2 3 4   # main runs
 """
 
 import argparse
+import gc
+import hashlib
 import json
 import os
 import sys
+import time
 from pathlib import Path
 
 import numpy as np
@@ -73,11 +76,56 @@ def text_sets(with_questions):
         add("q_sym_norm", sym["original_id"], [data.normalize_surface(data.format_question(q)) for q in sym["question"]],
             sym["template"].to_numpy(), sym["instance"].to_numpy())
         add("q_orig_norm", tmpl, [data.normalize_surface(data.format_question(tq[i])) for i in tmpl])
-    return pd.DataFrame(rows), test, (rq, ra), ref_idx
+    frame = pd.DataFrame(rows)
+    feats = pd.DataFrame([data.surface_features(t) for t in frame["text"]])
+    return pd.concat([frame, feats], axis=1), test, (rq, ra), ref_idx
 
 
 def nll_of(model, tok, texts, batch_size):
     return score.mean_nll(score.token_stats(model, tok, texts, device(), batch_size=batch_size))
+
+
+def save(path, write):
+    """Write through a temporary file and rename, so a file that exists is complete.
+
+    The results disk sometimes drops out for a few minutes: retry for up to 15 minutes.
+    """
+    path = Path(path)
+    tmp = path.with_name(path.name + ".tmp")
+    for attempt in range(31):
+        try:
+            write(tmp)
+            os.replace(tmp, path)
+            return
+        except OSError as err:
+            if attempt == 30:
+                raise
+            print(f"write to {path} failed ({err}); retrying in 30 s", flush=True)
+            time.sleep(30)
+
+
+def save_json(path, obj):
+    def write(tmp):
+        with open(tmp, "w") as f:
+            json.dump(obj, f)
+
+    save(path, write)
+
+
+def fingerprint(texts):
+    return hashlib.sha256("\x00".join(texts).encode("utf-8")).hexdigest()
+
+
+RUN_KEYS = ["target", "reference", "exposures", "per_group", "template_planted", "template_k", "wiki_tokens",
+            "block_len", "lr"]
+
+
+def free(model):
+    """Drop a model and give its memory back before the next one is loaded."""
+    del model
+    gc.collect()
+    if device().type == "mps":
+        torch.mps.empty_cache()
 
 
 def score_frame(model, tok, sets, ref_nll, batch_size):
@@ -104,10 +152,10 @@ def main():
     ap.add_argument("--lr", type=float, default=1e-4)
     ap.add_argument("--batch-size", type=int, default=16)
     ap.add_argument("--pilot", action="store_true", help="plant GSM8K train items only; no test items are touched")
-    ap.add_argument("--tag", default="")
+    ap.add_argument("--tag", default="", help="results/<tag>/; default <model>-lr<lr>[-pilot]")
     args = ap.parse_args()
 
-    tag = args.tag or args.target.split("/")[-1] + ("-pilot" if args.pilot else "")
+    tag = args.tag or f"{args.target.split('/')[-1]}-lr{args.lr:g}" + ("-pilot" if args.pilot else "")
     res = ROOT / "results" / tag
     res.mkdir(parents=True, exist_ok=True)
     tok = AutoTokenizer.from_pretrained(args.target, revision=REVISIONS[args.target])
@@ -121,48 +169,72 @@ def main():
     main_sets = sets[~sets["set"].str.startswith("q_")].reset_index(drop=True)
     texts = sets["text"].tolist()
 
+    keys = ["set", "idx", "template", "instance"]
+    assert (sets[keys].iloc[: len(main_sets)].to_numpy() == main_sets[keys].to_numpy()).all()
+    # cached reference and base scores must belong to exactly these texts
+    stamp = res / "texts.sha256"
+    if stamp.exists():
+        assert stamp.read_text().strip() == fingerprint(texts), "texts changed since the cached scores were made"
+    else:
+        save(stamp, lambda tmp: tmp.write_text(fingerprint(texts)))
+
     ref_cache = res / "ref_nll.npy"
     if not ref_cache.exists():
-        np.save(ref_cache, nll_of(load(args.reference), tok, texts, args.batch_size))
+        model = load(args.reference)
+        values = nll_of(model, tok, texts, args.batch_size)
+        free(model)
+        def write(tmp):
+            with open(tmp, "wb") as f:
+                np.save(f, values)
+
+        save(ref_cache, write)
     ref_nll = np.load(ref_cache)
+    assert len(ref_nll) == len(sets)
     main_ref = ref_nll[: len(main_sets)]
-    assert (sets["set"].iloc[: len(main_sets)].to_numpy() == main_sets["set"].to_numpy()).all()
 
     base_path = res / "scores_base.csv.gz"
     if not base_path.exists():
-        score_frame(load(args.target), tok, sets, ref_nll, args.batch_size).to_csv(base_path, index=False)
+        model = load(args.target)
+        frame = score_frame(model, tok, sets, ref_nll, args.batch_size)
+        free(model)
+        save(base_path, lambda tmp: frame.to_csv(tmp, index=False, compression="gzip"))
     base = pd.read_csv(base_path)
+    assert len(base) == len(sets) and (base[keys].to_numpy() == sets[keys].to_numpy()).all()
     base_nll = base["nll"].to_numpy()[: len(main_sets)]
 
     sym = data.load_gsm_symbolic()
     template_ids = sorted(sym["original_id"].unique())
+    run = {k: vars(args)[k] for k in RUN_KEYS}
     for seed in args.seeds:
         out = res / f"scores_seed{seed}.csv.gz"
-        if out.exists():
+        meta = res / f"groups_seed{seed}.json"
+        if out.exists() and meta.exists():
+            done = {k: json.loads(meta.read_text())["args"][k] for k in RUN_KEYS}
+            assert done == run, f"seed {seed} was run with {done}, not {run}"
             print(f"seed {seed}: already done", flush=True)
             continue
         groups = data.assign_groups(len(test), template_ids, args.exposures, args.per_group,
                                     args.template_planted, args.template_k, seed)
         counts = data.planted_counts(groups)
-        blocks, where, bstats = data.build_blocks(tok, wiki, test, counts, args.wiki_tokens, args.block_len, seed)
+        blocks, where, bstats = data.build_blocks(tok, wiki, test, counts, args.wiki_tokens, args.block_len, seed,
+                                                  multiple=STEP_BLOCKS)
         print(f"seed {seed}: {bstats}", flush=True)
         model = load(args.target)
         torch.manual_seed(seed)
-        log = train.train(model, blocks, device(), peak_lr=args.lr, seed=seed,
-                          log_path=res / f"trainlog_seed{seed}.json")
+        log = train.train(model, blocks, device(), peak_lr=args.lr, seed=seed)
+        save_json(res / f"trainlog_seed{seed}.json", log)
         df = score_frame(model, tok, main_sets, main_ref, args.batch_size)
-        del model
+        free(model)
         df["oracle"] = base_nll - df["nll"]
         label = {i: g for g, idx in groups.items() for i in idx}
         df["group"] = [label.get(i, "-") if s in ("test", "orig_norm", "sym_raw", "sym_norm") else "-"
                        for s, i in zip(df["set"], df["idx"])]
         df["seed"] = seed
-        df.to_csv(out, index=False)
         steps = {int(i): sorted(p // STEP_BLOCKS for p in pos) for i, pos in where.items()}
-        with open(res / f"groups_seed{seed}.json", "w") as f:
-            json.dump({"groups": groups, "exposure_steps": steps, "corpus": bstats,
-                       "total_steps": len(blocks) // STEP_BLOCKS, "final_loss": log[-1]["loss"],
-                       "args": vars(args)}, f)
+        assert max(max(v) for v in steps.values()) < len(log), "a planted copy sits in an untrained block"
+        save_json(meta, {"groups": groups, "exposure_steps": steps, "corpus": bstats,
+                         "total_steps": len(log), "final_loss": log[-1]["loss"], "args": vars(args)})
+        save(out, lambda tmp: df.to_csv(tmp, index=False, compression="gzip"))  # written last: marks the seed done
 
 
 def run_pilot(args, tok, wiki, res):
@@ -178,27 +250,42 @@ def run_pilot(args, tok, wiki, res):
         pos += args.per_group
     groups["unseen"] = order[pos : pos + 600].tolist()
     counts = data.planted_counts(groups)
-    blocks, _, bstats = data.build_blocks(tok, wiki, items, counts, args.wiki_tokens, args.block_len, 99)
+    blocks, _, bstats = data.build_blocks(tok, wiki, items, counts, args.wiki_tokens, args.block_len, 99,
+                                          multiple=STEP_BLOCKS)
     print(f"pilot corpus: {bstats}", flush=True)
     model = load(args.target)
-    train.train(model, blocks, device(), peak_lr=args.lr, seed=99, log_path=res / f"trainlog_lr{args.lr:g}.json")
+    save_json(res / f"trainlog_lr{args.lr:g}.json", train.train(model, blocks, device(), peak_lr=args.lr, seed=99))
     idx = [i for g in groups.values() for i in g]
     texts = [items[i] for i in idx]
-    ft = nll_of(model, tok, texts, args.batch_size)
     stats = score.token_stats(model, tok, texts, device(), batch_size=args.batch_size)
-    del model
-    base_nll = nll_of(load(args.target), tok, texts, args.batch_size)
-    ref_nll = nll_of(load(args.reference), tok, texts, args.batch_size)
+    ft = score.mean_nll(stats)
+    free(model)
+    model = load(args.target)
+    base_nll = nll_of(model, tok, texts, args.batch_size)
+    free(model)
+    model = load(args.reference)
+    ref_nll = nll_of(model, tok, texts, args.batch_size)
+    free(model)
     s = score.detector_scores(texts, stats, ref_nll=ref_nll)
     s["oracle"] = base_nll - ft
     lab = np.array([g for g, ids in groups.items() for _ in ids])
     report = {}
     for d, v in s.items():
         neg = v[lab == "unseen"]
-        report[d] = {k: round(metrics.auroc(v[lab == f"k{k}"], neg), 3) for k in args.exposures}
-        print(d, report[d], flush=True)
-    with open(res / f"pilot_lr{args.lr:g}.json", "w") as f:
-        json.dump({"auroc": report, "corpus": bstats}, f, indent=1)
+        report[d] = {k: float(metrics.auroc(v[lab == f"k{k}"], neg)) for k in args.exposures}
+        print(d, {k: round(a, 4) for k, a in report[d].items()}, flush=True)
+    # pilot rule, ANALYSIS_PLAN.md section 5
+    if report["loss"][4] >= 0.98:
+        decision = 3e-5
+    elif report["loss"][16] < 0.75:
+        decision = 3e-4
+    else:
+        decision = args.lr
+    print(f"pilot rule: loss AUROC k=4 {report['loss'][4]:.4f}, k=16 {report['loss'][16]:.4f} -> lr {decision:g}",
+          flush=True)
+    save_json(res / f"pilot_lr{args.lr:g}.json",
+              {"auroc": report, "corpus": bstats, "decision_lr": decision,
+               "scores": {d: v.tolist() for d, v in s.items()}, "groups": lab.tolist()})
 
 
 if __name__ == "__main__":

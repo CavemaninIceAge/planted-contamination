@@ -41,6 +41,25 @@ def normalize_surface(text):
     return re.sub(r"\n\s*\n####", "\n####", text)
 
 
+SURFACE_FEATURES = ["n_chars", "n_digits", "digit_share", "longest_number", "non_ascii_share",
+                    "other_currency", "dot_zero"]
+
+
+def surface_features(text):
+    """Numbers that describe how a text looks, for the blind baseline and covariate adjustment."""
+    digits = sum(c.isdigit() for c in text)
+    runs = re.findall(r"\d+", text)
+    return {
+        "n_chars": len(text),
+        "n_digits": digits,
+        "digit_share": digits / max(1, len(text)),
+        "longest_number": max((len(r) for r in runs), default=0),
+        "non_ascii_share": sum(ord(c) > 127 for c in text) / max(1, len(text)),
+        "other_currency": sum(unicodedata.category(c) == "Sc" and c != "$" for c in text),
+        "dot_zero": len(re.findall(r"\d\.0\b", text)),
+    }
+
+
 def _parquet(repo, name, rev):
     return pd.read_parquet(hf_hub_download(repo, name, repo_type="dataset", revision=rev))
 
@@ -117,13 +136,15 @@ def planted_counts(groups):
     return counts
 
 
-def build_blocks(tokenizer, wiki_docs, items, counts, wiki_tokens, block_len, seed):
+def build_blocks(tokenizer, wiki_docs, items, counts, wiki_tokens, block_len, seed, multiple=1):
     """Pack WikiText plus planted items into fixed-length training blocks.
 
     Wiki text is streamed and cut at block edges like ordinary pretraining packing. Each
     planted copy stays whole inside one block, wrapped as [EOS] item [EOS] so it starts on a
     document boundary (matching how items are scored); copies of one item go to different
-    blocks. Returns the blocks in training order, the block index of every copy, and stats.
+    blocks. The block count is a multiple of `multiple` (blocks per optimizer step), so no
+    block is left over at the end of training. Returns the blocks in training order, the
+    block index of every copy, and stats.
     """
     rng = np.random.default_rng(seed)
     eos = tokenizer.eos_token_id
@@ -141,7 +162,7 @@ def build_blocks(tokenizer, wiki_docs, items, counts, wiki_tokens, block_len, se
         assert len(ids) <= block_len, "item longer than a training block"
         copies.extend([(idx, ids)] * k)
     planted_tokens = sum(len(ids) for _, ids in copies)
-    n_blocks = (len(wiki) + planted_tokens) // block_len
+    n_blocks = (len(wiki) + planted_tokens) // block_len // multiple * multiple
 
     room = np.full(n_blocks, block_len)
     members = [[] for _ in range(n_blocks)]

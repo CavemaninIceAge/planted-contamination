@@ -105,3 +105,22 @@ Primary families, each Holm-corrected over the five detectors:
 
 Everything else is descriptive or exploratory and is reported with unadjusted intervals only.
 Claims of "no effect" use equivalence bounds (AUROC within 0.5 +/- 0.05) on 90% intervals.
+
+## 7. Amendments before the main runs
+
+Made after the commit above, before any main run and before any score on GSM8K test items was
+computed. A code review found them; each is a fix, not a choice informed by results.
+
+1. **Training precision.** Training now runs in float32 throughout instead of bfloat16 autocast.
+   Pythia's logits share a large offset (mean |logit| about 740 on pythia-160m), and under
+   autocast the rounding of the logits alone raised the cross-entropy of a 16 x 512 WikiText
+   batch from 3.81 to 4.36 nats; keeping only the head in float32 still left +0.07. The learning
+   rate pilot was rerun in float32 with the same rule.
+2. **Every planted copy is trained on.** The block count is now a multiple of the 16 blocks per
+   optimizer step; before, up to 15 blocks at the end of the shuffled corpus, with the planted
+   copies in them, were never trained on.
+3. **Threshold rule.** The code now implements the conformal rule of section 4 (it used a plain
+   empirical quantile before).
+4. **Bookkeeping.** Results are written atomically, cached base and reference scores are tied to
+   a hash of the scored texts, a seed is skipped on resume only if it was run with the same
+   settings, and the default results directory includes the learning rate.

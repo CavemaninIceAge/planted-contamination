@@ -24,33 +24,50 @@ class TokenStats:
 
 
 @torch.no_grad()
-def token_stats(model, tokenizer, texts, device, batch_size=16, max_len=512):
-    """Score each text with a BOS token prepended, so the first real token is scored too."""
+def token_stats(model, tokenizer, texts, device, batch_size=16, max_len=512, max_batch_tokens=4096,
+                row_chunk=1024):
+    """Score each text with a BOS token prepended, so the first real token is scored too.
+
+    Texts are batched longest first, so padding stays small, and a batch holds at most
+    `max_batch_tokens` tokens. The softmax over the vocabulary is taken only at real
+    (non-padding) positions, `row_chunk` positions at a time, which keeps memory bounded.
+    Results come back in the order of `texts`.
+    """
     bos = tokenizer.bos_token_id if tokenizer.bos_token_id is not None else tokenizer.eos_token_id
     encoded = [[bos] + tokenizer(t)["input_ids"][: max_len - 1] for t in texts]
-    out = []
+    order = sorted(range(len(encoded)), key=lambda i: -len(encoded[i]))
+    out = [None] * len(encoded)
     model.eval()
-    for i in range(0, len(encoded), batch_size):
-        chunk = encoded[i : i + batch_size]
-        width = max(len(ids) for ids in chunk)
+    start = 0
+    while start < len(order):
+        width = len(encoded[order[start]])
+        chunk = order[start : start + max(1, min(batch_size, max_batch_tokens // width))]
+        start += len(chunk)
         ids = torch.full((len(chunk), width), bos, dtype=torch.long)
         mask = torch.zeros((len(chunk), width), dtype=torch.long)
-        for j, seq in enumerate(chunk):
-            ids[j, : len(seq)] = torch.tensor(seq)
-            mask[j, : len(seq)] = 1
+        for j, i in enumerate(chunk):
+            ids[j, : len(encoded[i])] = torch.tensor(encoded[i])
+            mask[j, : len(encoded[i])] = 1
         ids, mask = ids.to(device), mask.to(device)
-        logits = model(input_ids=ids, attention_mask=mask).logits[:, :-1].float()
-        logprobs = torch.log_softmax(logits, dim=-1)
-        target = ids[:, 1:]
-        lp = logprobs.gather(-1, target.unsqueeze(-1)).squeeze(-1)
-        probs = logprobs.exp()
-        mu = (probs * logprobs).sum(-1)
-        var = (probs * logprobs.pow(2)).sum(-1) - mu.pow(2)
-        sigma = var.clamp_min(1e-12).sqrt()
         valid = mask[:, 1:].bool()
-        for j in range(len(chunk)):
-            v = valid[j]
-            out.append(TokenStats(lp[j][v].cpu().numpy(), mu[j][v].cpu().numpy(), sigma[j][v].cpu().numpy()))
+        rows = model(input_ids=ids, attention_mask=mask).logits[:, :-1][valid].float()  # (n_valid, vocab)
+        target = ids[:, 1:][valid]
+        lp, mu, sigma = [], [], []
+        for r in range(0, rows.size(0), row_chunk):
+            logprobs = torch.log_softmax(rows[r : r + row_chunk], dim=-1)
+            probs = logprobs.exp()
+            m = (probs * logprobs).sum(-1)
+            lp.append(logprobs.gather(-1, target[r : r + row_chunk, None]).squeeze(-1))
+            mu.append(m)
+            sigma.append((probs * (logprobs - m[:, None]).square()).sum(-1).clamp_min(1e-12).sqrt())
+        lp, mu, sigma = (torch.cat(x).cpu().numpy() for x in (lp, mu, sigma))
+        pos = 0
+        for i, n in zip(chunk, valid.sum(1).tolist()):
+            out[i] = TokenStats(lp[pos : pos + n], mu[pos : pos + n], sigma[pos : pos + n])
+            pos += n
+        del rows
+    if device.type == "mps":
+        torch.mps.empty_cache()
     return out
 
 

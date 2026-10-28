@@ -23,14 +23,22 @@ def test_auroc_extremes():
     assert metrics.auroc([1, 1], [1, 1]) == 0.5
 
 
-def test_threshold_respects_alpha():
+def test_conformal_threshold_order_statistic():
+    ref = np.arange(1, 101, dtype=float)  # n = 100: ceil(101 * 0.95) = 96th smallest
+    assert metrics.conformal_threshold(ref, 0.05) == 96.0
+    assert metrics.conformal_threshold(np.arange(10.0), 0.05) == np.inf  # too few to reach 95%
+
+
+def test_conformal_threshold_false_positive_rate():
+    """With exchangeable reference and test draws, the flag rate stays at or below alpha."""
     rng = np.random.default_rng(1)
-    for n in (20, 99, 100, 435):
-        neg = rng.normal(size=n)
-        t = metrics.threshold_at_fpr(neg, 0.05)
-        assert metrics.rate_above(neg, t) <= 0.05
-        # one notch lower would exceed alpha or pass the same count
-        assert np.sum(neg > t) == int(np.floor(0.05 * n))
+    for n in (20, 99, 435):
+        flagged = [rng.normal() > metrics.conformal_threshold(rng.normal(size=n), 0.05) for _ in range(20000)]
+        assert np.mean(flagged) <= 0.05 + 3 * np.sqrt(0.05 * 0.95 / 20000)
+
+
+def test_holm():
+    assert np.allclose(metrics.holm([0.01, 0.04, 0.03, 0.2]), [0.04, 0.09, 0.09, 0.2])
 
 
 def test_paired_auroc():
@@ -123,6 +131,30 @@ def test_corpus_has_exact_copy_counts():
         assert stream.count("|" + item + "|") == counts.get(i, 0)
     assert {i: len(v) for i, v in where.items()} == counts
     assert all(len(set(v)) == len(v) for v in where.values())  # copies sit in different blocks
+
+
+def test_block_count_is_multiple_of_step():
+    tok = CharTok()
+    items = [f"Question: item {i} ### Answer: {i * 7}" for i in range(30)]
+    wiki = [("lorem ipsum dolor sit amet " * 40) + str(i) for i in range(400)]
+    counts = {3: 1, 5: 4, 8: 16}
+    blocks, where, _ = data.build_blocks(tok, wiki, items, counts, 120_000, 512, seed=0, multiple=16)
+    assert len(blocks) % 16 == 0
+    assert {i: len(v) for i, v in where.items()} == counts
+
+
+def test_token_stats_order_does_not_depend_on_batching():
+    model, tok = TinyLM(), TinyTok()
+    texts = ["a", "abcdefgh", "abc", "hello world", "xy"]
+    one = score.token_stats(model, tok, texts, torch.device("cpu"), batch_size=1)
+    many = score.token_stats(model, tok, texts, torch.device("cpu"), batch_size=4, max_batch_tokens=20, row_chunk=3)
+    for a, b in zip(one, many):
+        assert np.allclose(a.logp, b.logp, atol=1e-6) and np.allclose(a.sigma, b.sigma, atol=1e-6)
+
+
+def test_surface_features():
+    f = data.surface_features("Costs €14.0 and 2,500 \u00f7 5")
+    assert f["other_currency"] == 1 and f["dot_zero"] == 1 and f["longest_number"] == 3
 
 
 def test_normalize_surface():

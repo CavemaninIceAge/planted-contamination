@@ -15,12 +15,15 @@ def auroc(pos, neg):
     return u / (len(pos) * len(neg))
 
 
-def threshold_at_fpr(neg_calib, alpha=0.05):
-    """Smallest threshold t such that the share of calibration negatives with score > t is <= alpha."""
-    neg = np.sort(np.asarray(neg_calib, float))
-    n = len(neg)
-    allowed = int(np.floor(alpha * n))  # negatives we may let through
-    return neg[n - allowed - 1]
+def conformal_threshold(reference, alpha=0.05):
+    """Split-conformal threshold: the ceil((n + 1)(1 - alpha))-th smallest reference score.
+
+    Flag a score when it is strictly above the threshold. If the reference and a new unseen
+    item are exchangeable, the item is flagged with probability at most alpha.
+    """
+    ref = np.sort(np.asarray(reference, float))
+    k = int(np.ceil((len(ref) + 1) * (1 - alpha)))
+    return np.inf if k > len(ref) else float(ref[k - 1])
 
 
 def rate_above(scores, t):
@@ -75,3 +78,14 @@ def wilson(k, n, z=1.96):
     centre = (p + z * z / (2 * n)) / denom
     half = z * np.sqrt(p * (1 - p) / n + z * z / (4 * n * n)) / denom
     return float(centre - half), float(centre + half)
+
+
+def holm(pvalues):
+    """Holm step-down adjusted p-values (family-wise error control)."""
+    p = np.asarray(pvalues, float)
+    adjusted = np.empty_like(p)
+    running = 0.0
+    for rank, i in enumerate(np.argsort(p)):
+        running = max(running, min(1.0, (len(p) - rank) * p[i]))
+        adjusted[i] = running
+    return adjusted

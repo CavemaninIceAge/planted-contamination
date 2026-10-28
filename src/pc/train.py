@@ -1,10 +1,11 @@
 """Continued pretraining on the contaminated corpus: a plain PyTorch loop (no Trainer).
 
-Weights and optimizer state stay in float32; the forward pass runs under bfloat16 autocast,
-and the loss is computed in float32.
+Everything runs in float32 by default. Pythia's logits share a large offset (mean |logit| about
+740 on pythia-160m), so under bfloat16 autocast the rounding of the logits alone raised the
+cross-entropy of a WikiText batch from 3.81 to 4.36 nats; keeping only the head in float32
+still left +0.07. `amp=True` is kept for speed experiments only.
 """
 
-import json
 import math
 import time
 
@@ -27,7 +28,7 @@ def lr_at(step, total, peak, warmup, floor=0.1):
 
 
 def train(model, blocks, device, peak_lr=1e-4, micro_batch=8, accum=2, warmup=30,
-          weight_decay=0.1, clip=1.0, seed=0, amp=True, log_path=None):
+          weight_decay=0.1, clip=1.0, seed=0, amp=False):
     torch.manual_seed(seed)
     model.train()
     model.config.use_cache = False
@@ -59,7 +60,4 @@ def train(model, blocks, device, peak_lr=1e-4, micro_batch=8, accum=2, warmup=30
             rate = (step + 1) * per_step * blocks.shape[1] / (time.time() - start)
             print(f"step {step:4d}/{total}  loss {step_loss:.4f}  lr {log[-1]['lr']:.2e}  {rate:,.0f} tok/s", flush=True)
     model.eval()
-    if log_path:
-        with open(log_path, "w") as f:
-            json.dump(log, f)
     return log
