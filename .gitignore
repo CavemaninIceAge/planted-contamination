@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+.work/
+data/
+*.pt
+*.safetensors
+results/*/ref_nll.npy
+results/*-pilot*/
+.DS_Store
