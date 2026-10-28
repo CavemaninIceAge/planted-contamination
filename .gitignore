@@ -5,5 +5,6 @@ data/
 *.pt
 *.safetensors
 results/*/ref_nll.npy
-results/*-pilot*/
+results/*-pilot*/*
+!results/*-pilot*/pilot_*.json
 .DS_Store

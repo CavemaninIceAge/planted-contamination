@@ -1,6 +1,6 @@
 #!/bin/sh
 # Pilot -> learning rate by the pilot rule -> 5 main seeds -> tables and figures.
-# About 3 hours on an Apple M6 (pilot ~25 min, base scoring ~15 min, ~27 min per seed).
+# About 3 hours on an Apple M6 (pilot ~25 min, base scoring ~15 min, ~30 min per seed).
 set -e
 cd "$(dirname "$0")/.."
 PY=${PYTHON:-python}
